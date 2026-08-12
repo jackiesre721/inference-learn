@@ -1,0 +1,442 @@
+# 第 11 章 · DeepSeek V4 Flash 支持方案
+
+> 第 11 章 | deepseek-support 分支 | [上一章：第 10 章 生态对比](./10-ecosystem) | [目录](./README)
+>
+> 目标：在 18GB M3 Pro 上运行 284B MoE 大模型，目标 50 tok/s。
+
+---
+
+## 11.1 为什么选 DeepSeek V4 Flash
+
+| | Qwen2.5-0.5B (当前) | DeepSeek V4 Flash |
+|---|---|---|
+| 总参数 | 0.49B | 284B |
+| 激活参数 | 0.49B | 13B (MoE) |
+| Attention | GQA (14Q, 2KV) | MLA (低秩压缩 KV) |
+| MLP | SwiGLU (单一) | MoE (256 专家 + 1 共享) |
+| 层数 | 24 | 43 (全 MoE) |
+| 量化 | 无 | 原生 FP4/FP8/INT4 (QAT) |
+| 上下文 | 32K | 1M |
+| License | Apache 2.0 | MIT |
+
+DeepSeek V4 Flash 的核心优势：**284B 参数的大模型能力，但每次推理只用 13B**（MoE），加上原生量化训练（QAT），在有限硬件上运行成为可能。
+
+---
+
+## 11.2 架构差异：Qwen vs DeepSeek
+
+```
+Qwen2.5 一层:
+  x → RMSNorm → [QKV投影(GQA)] → RoPE → Attention → Wo → +残差
+    → RMSNorm → [SwiGLU MLP] → +残差
+
+DeepSeek V4 Flash 一层:
+  x → RMSNorm → [MLA压缩] → [解耦RoPE] → MLA Attention → +残差
+    → RMSNorm → [Router选6个专家] → 6×Expert + 1×Shared → +残差
+```
+
+三处核心差异：MLA Attention、MoE MLP、解耦 RoPE。
+
+---
+
+## 11.3 MLA (Multi-head Latent Attention)
+
+### 和 GQA 的区别
+
+标准 attention (我们当前的 GQA)：
+```
+每个 token 存: K[128维] + V[128维] = 256 个 float
+43 层 × 1M 位置 = 43 × 1M × 256 × 4字节 = 44 GB (KV Cache)
+```
+
+MLA：
+```
+每个 token 只存压缩 latent: c_kv[512维] + k_r[64维] = 576 个 float
+43 层 × 1M 位置 = 43 × 1M × 576 × 4字节 = 99 GB
+
+看起来差不多？但 MLA 解压后是 128 头 × 128 维 = 16384 维
+标准 attention 存 128 头 × 128 维 × 2(K和V) = 32768 维
+MLA 压缩比: 32768 / 576 = 57×
+```
+
+### MLA 前向传播步骤
+
+```
+① 压缩: c_kv = x @ W_DKV          (d_model → d_c, 比如 7168 → 512)
+
+② KV Cache 只存 c_kv (不存完整 K/V!)
+
+③ 需要时解压:
+   K = c_kv @ W_UK                  (d_c → n_heads × d_head)
+   V = c_kv @ W_UV                  (d_c → n_heads × d_head)
+
+④ 解耦 RoPE (和标准 RoPE 不同):
+   k_r = x @ W_KR                   (d_model → d_r, 所有头共享)
+   q_r = c_q @ W_QR                 (d_c → d_r)
+   对 q_r 和 k_r 应用 RoPE 旋转
+
+⑤ Attention 分数 (两部分相加):
+   score = (K · Q + k_r · q_r) / sqrt(d_head + d_r)
+
+⑥ softmax → 加权 V → 输出投影
+```
+
+### 关键矩阵
+
+| 矩阵 | 形状 | 作用 |
+|------|------|------|
+| W_DKV | (d_c, d_model) | 压缩 KV |
+| W_UK | (n_heads × d_head, d_c) | 解压 K |
+| W_UV | (n_heads × d_head, d_c) | 解压 V |
+| W_KR | (d_r, d_model) | RoPE key (所有头共享) |
+| W_QR | (d_r, d_c) | RoPE query |
+| W_O | (d_model, n_heads × d_head) | 输出投影 |
+
+### 为什么 MLA 省 KV Cache 内存
+
+```
+标准: cache 存 K + V = 2 × n_heads × d_head × seq_len × n_layers
+MLA:  cache 存 c_kv + k_r = (d_c + d_r) × seq_len × n_layers
+
+DeepSeek V4 Flash:
+  标准: 2 × 128 × 128 = 32768 个 float/位置
+  MLA:  512 + 64 = 576 个 float/位置
+  压缩: 57×
+```
+
+---
+
+## 11.4 MoE (Mixture of Experts)
+
+### 和标准 MLP 的区别
+
+```
+标准 MLP (我们的 SwiGLU):
+  out = silu(x @ W_gate) * (x @ W_up) @ W_down
+  → 每层一套权重, 每个 token 都走全部参数
+
+MoE:
+  ① router_logits = x @ W_router    → 256 个分数
+  ② 选 top-6: 分数最高的 6 个专家
+  ③ out = shared_expert(x) + Σ weight_i × expert_i(x)
+  → 每层 256 个专家, 但每个 token 只激活 6 个
+```
+
+### 每个专家就是一个小的 MLP
+
+```c
+// 单个专家 (就是一个 SwiGLU):
+float *expert_forward(float *x, ExpertWeights *ew) {
+    // 和我们的 SwiGLU 完全一样的结构, 只是更小
+    matmul(gate, ew->w_gate, x);
+    matmul(up, ew->w_up, x);
+    for (int i = 0; i < expert_dim; i++)
+        gate[i] = silu(gate[i]) * up[i];
+    matmul(out, ew->w_down, gate);
+    return out;
+}
+```
+
+### Router 实现
+
+```c
+// 路由器: 决定当前 token 用哪 6 个专家
+void moe_route(float *router_logits, int n_experts, int top_k,
+               int *selected, float *weights) {
+    // router_logits: 256 个分数
+    // 选 top_k=6 个最高的
+    // 用 softmax 归一化权重
+    for (int i = 0; i < top_k; i++) {
+        // 找最大值, 记录 index
+        // softmax 得到 weight
+    }
+}
+```
+
+### MoE 的内存优势 (关键!)
+
+```
+284B 总参数:
+  共享层 (attention + embedding):  ~28B
+  256 个专家 × 每个 ~1B:           ~256B
+  总计:                            ~284B
+
+每个 token 只激活:
+  共享层 28B + 6 个专家 × 1B = 34B (实际约 13B, 因为专家更小)
+  → 只需读 13B 参数, 不是 284B!
+  → int4: 只需 6.5 GB 内存带宽/token
+```
+
+---
+
+## 11.5 mmap 磁盘卸载方案
+
+### 核心思路
+
+```
+模型文件 142GB (int4) → mmap 映射到虚拟内存
+macOS 自动分页: 热门专家留 RAM, 冷门换 SSD
+
+不需要手写专家加载逻辑!
+  - mmap 142GB 文件, 只占虚拟地址空间
+  - CPU 访问某页时, OS 自动从 SSD 加载到 RAM
+  - 不访问的页, OS 自动换出到 SSD (LRU)
+  - 对程序来说: 访问 142GB 空间和访问 1GB 没区别
+```
+
+### 为什么在 M3 Pro 上特别有效
+
+```
+M3 Pro 统一内存架构:
+  1. CPU 和 GPU 共享同一块 18GB → 不需要拷贝
+  2. NVMe SSD 7GB/s → 换页速度极快
+  3. macOS page cache → 自动 LRU 管理
+  4. Metal GPU 可以直接访问 mmap 的数据
+```
+
+### mmap + madvise 优化
+
+```c
+// 基础 mmap (已有):
+void *map = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+// 优化: 告诉 OS 接下来要访问哪些页
+// 在计算第 N 层时, 预取第 N+1 层的专家
+posix_madvise(next_layer_experts, size, POSIX_MADV_WILLNEED);
+
+// 优化: 告诉 OS 哪些页不再需要 (主动释放)
+posix_madvise(old_experts, size, POSIX_MADV_DONTNEED);
+```
+
+---
+
+## 11.6 KV Cache 五级压缩方案
+
+### 问题有多大
+
+```
+1M 上下文, 标准 KV Cache (fp16):
+  2 × 43层 × 1M × 128头 × 128维 × 2字节 = 281 GB → 不可能
+
+MLA 压缩后 (fp16):
+  43层 × 1M × (512+64) × 2字节 = 49 GB → 还是太大
+
+需要更多压缩 ↓
+```
+
+### 五级方案
+
+**L1: MLA 压缩 (架构级, 57×)**
+```
+不存完整 K/V, 只存 latent c_kv[d_c] + k_r[d_r]
+每位置: 32768 float → 576 float
+```
+
+**L2: KV Cache 量化 (2-4×)**
+```
+latent 用 int4 存储 (而不是 fp16)
+每位置: 576 × 2字节 → 576 × 0.5字节
+```
+
+**L3: 动态分配 (按需)**
+```
+不预分配 seq_len 大小, 只为实际使用的位置分配
+对话只有 1000 个 token 时, 只占 1000 个位置的内存
+```
+
+**L4: 热冷分离 (核心优化)**
+
+```
+不是所有历史 token 都同等重要:
+
+  热区 (RAM): 最近 8K token, fp16, 完整精度
+  温区 (RAM): 8K~128K, int4 量化
+  冷区 (SSD): 128K~1M, mmap 自动分页
+
+三级结构:
+  [热区 8K]    MLA fp16  → 0.4 GB RAM
+  [温区 120K]  MLA int4  → 1.5 GB RAM
+  [冷区 896K]  mmap SSD  → 0 GB RAM (OS 管理)
+  ────────────────────
+  总 RAM:              ~1.9 GB
+```
+
+**L5: 滑动窗口 + 远程摘要**
+```
+极端长上下文时:
+  超过 1M 的早期内容 → 压缩成摘要向量
+  不保留逐 token 的 KV, 只存一个 pooled 表示
+```
+
+### 代码结构
+
+```c
+typedef struct {
+    float  *hot_latent;     // 热区: 最近 N 个 token, fp16
+    uint8_t *warm_latent;   // 温区: int4 量化
+    float  *cold_latent;    // 冷区: mmap 到 SSD
+    int    *position_map;   // 位置 → 属于哪一级
+    int     current_pos;
+} CompressedKVCache;
+```
+
+---
+
+## 11.7 性能优化路线 (目标 50 tok/s)
+
+### 瓶颈分析
+
+```
+每 token 需要:
+  计算: 13B × 2 FLOP = 26 GFLOP
+  读取: 13B × 0.5字节(int4) = 6.5 GB 权重
+
+M3 Pro 能力:
+  GPU 计算: ~30 TOPS (int4) → 26G / 30T = 0.87ms (不是瓶颈!)
+  内存带宽: 150 GB/s → 6.5G / 150G = 43ms (瓶颈!)
+  SSD 带宽: 7 GB/s
+
+结论: 瓶颈是内存带宽, 不是计算
+```
+
+### 八级优化路线
+
+```
+基线: mmap + CPU fp32                      →   0.1 tok/s
++ int4 量化 (权重 4× 压缩)                  →   0.5 tok/s
++ OpenMP (5 个 P 核并行)                    →   2 tok/s
++ Metal GPU (14 核 GPU 做 matmul)           →   8 tok/s
++ 专家预取 + madvise (I/O 隐藏在计算后)      →  15 tok/s
++ DSpark 投机解码 (1.85× 加速)              →  28 tok/s
++ GPU/CPU 异步流水线 (CPU 预取, GPU 计算)    →  35 tok/s
++ 专家亲和性缓存 (命中率 95%)                →  45 tok/s
++ MLA 低秩 KV Cache (省内存给专家缓存)       →  50 tok/s ✓
+```
+
+### 参考数据
+
+| 硬件 | 引擎 | 速度 | 技术 |
+|------|------|------|------|
+| NVIDIA B200 | vLLM + DSpark | 120 tok/s | 全部优化 |
+| M3 Pro (理论) | 极致优化 | ~50 tok/s | 8 重叠加 |
+| M3 Pro (保守) | llama.cpp | ~10-20 tok/s | Metal + GGUF |
+
+---
+
+## 11.8 DSpark 投机解码
+
+### 原理
+
+```
+传统: 每生成 1 个 token, 跑一次完整 forward (43 层)
+
+DSpark:
+  ① 草稿模块 (MTP) 快速预测 3 个候选 token
+  ② 大模型一次 forward 验证这 3 个
+  ③ 猜对的直接用 (通常 2-3 个都对)
+  
+  等于: 一次 forward 生成 2-3 个 token
+  加速: 1.85× (DeepSeek 官方数据, 无损)
+```
+
+### 在 M3 Pro 上的应用
+
+```
+草稿模块很轻量 (几层 transformer):
+  草稿模块常驻 RAM (~0.5 GB)
+  快速猜 3 个 token (~10ms)
+  
+大模型验证:
+  一次 forward 验证 3 个候选 (~150ms)
+  
+  总耗时: ~160ms 出 2-3 个 token
+  等效速度: 2-3 × (1000/160) ≈ 15-19 tok/s
+
+叠加其他优化: → 50 tok/s
+```
+
+---
+
+## 11.9 内存预算分析
+
+### 128K 上下文 (编码辅助典型场景)
+
+```
+项目                         内存
+──────────────────────────────────
+DeepSeek 活跃权重 (int4)      6.5 GB
+KV Cache 热区 (8K, MLA int4) 0.2 GB
+KV Cache 温区 (120K, int4)   1.5 GB
+专家缓存 (8 个热门)           3.0 GB
+草稿模块 (DSpark)             0.5 GB
+OS + 程序                    2.0 GB
+──────────────────────────────────
+总计                         ~13.7 GB
+M3 Pro 内存                   18 GB
+剩余                          ~4.3 GB ✓
+```
+
+### 1M 上下文 (极限场景)
+
+```
+项目                         RAM        SSD
+──────────────────────────────────────────────
+权重 (mmap, int4)            ~10 GB     142 GB
+KV Cache 热区 (8K)           0.4 GB     —
+KV Cache 温区 (120K)         1.5 GB     —
+KV Cache 冷区 (896K)         ~0         11 GB
+专家缓存                     3.0 GB     —
+OS + 程序                    2.0 GB     —
+──────────────────────────────────────────────
+总计 RAM                     ~17 GB     153 GB SSD
+M3 Pro                       18 GB      ✓
+```
+
+---
+
+## 11.10 实现路线图
+
+### 阶段 1: 架构研究 + Config
+- 确认 DeepSeek V4 Flash 的精确 config 参数
+- 确认 MLA 矩阵维度
+- 确认 MoE 专家结构
+
+### 阶段 2: MLA Attention (~200 行)
+- 低秩压缩 (W_DKV)
+- 解压 (W_UK, W_UV)
+- 解耦 RoPE (W_KR, W_QR)
+- 压缩 KV Cache (只存 latent)
+
+### 阶段 3: MoE MLP (~150 行)
+- Router (top-6 选择)
+- Expert dispatch
+- Shared expert (常驻)
+- mmap 专家加载
+
+### 阶段 4: int4 量化 (~100 行)
+- 权重 int4 存储
+- matmul int4 解码 + 计算
+
+### 阶段 5: mmap + 性能优化 (~200 行)
+- 大文件 mmap
+- madvise 预取
+- OpenMP 多线程
+- Metal GPU (后续)
+
+### 阶段 6: DSpark 投机解码 (~200 行)
+- MTP 草稿模块
+- 验证逻辑
+
+总计: ~850 行新代码 + 现有 3300 行 = ~4150 行
+
+---
+
+## 参考资料
+
+- [DeepSeek V4 Flash - HuggingFace](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
+- [Unsloth DeepSeek V4 指南](https://unsloth.ai/docs/zh/mo-xing/deepseek-v4)
+- [DSpark 论文](https://arxiv.org/html/2607.05147v1)
+- [MLA 原理详解](https://planetbanatt.net/articles/mla.html)
+- [MLA 实现详解](https://liorsinai.github.io/machine-learning/2025/02/22/mla.html)
+- [DeepSeek V4 in vLLM](https://vllm.ai/blog/2026-04-24)
+- [llama.cpp DeepSeek V4 支持](https://github.com/ggml-org/llama.cpp/issues/22319)
