@@ -2,161 +2,194 @@
 #define DEEPSEEK_H
 
 /*
- * deepseek.h — DeepSeek V4 Flash 架构定义
+ * deepseek.h — DeepSeek V4 Flash 架构定义 (基于真实 config.json + model.py)
  *
- * 来自 deepseek_config.json (DeepSeek-V4-Flash-0731) 的精确参数。
+ * V4 Flash 的 MLA 和 V2/V3 完全不同:
  *
- * 和 Qwen2.5 的核心差异:
- *   1. MLA Attention (低秩压缩 KV, 解耦 RoPE)
- *   2. MoE MLP (256 路由专家 + 1 共享专家, top-6)
- *   3. 原生 FP4 专家权重 + FP8 量化
- *   4. DSpark 投机解码 (block_size=5)
- *   5. YaRN RoPE scaling (支持 1M 上下文)
- *   6. 层级压缩 (alternating compress ratios)
- *   7. Hash routing (前 3 层) + sqrtsoftplus scoring
- *   8. Index attention (稀疏注意力, 1M 上下文)
+ *   Query 路径:
+ *     x[4096] → wq_a[1024, 4096] → c_q[1024]
+ *             → q_norm (RMSNorm 1024)
+ *             → wq_b[32768, 1024] → Q[64 heads × 512 dim]
+ *             → per-head RMSNorm
+ *             → RoPE 对最后 64 维旋转 (qk_rope_head_dim=64)
+ *
+ *   KV 路径 (MLA 核心):
+ *     x[4096] → wkv[512, 4096] → kv[512]   ← 只存这个! KV Cache
+ *             → kv_norm (RMSNorm 512)
+ *             → RoPE 对最后 64 维旋转
+ *     注意: V4 不显式解压 K/V! kv[512] 直接参与 attention
+ *     Q[512] · kv[512] 做 attention (512 维向量内积)
+ *
+ *   Attention:
+ *     sparse_attn: 不是全因果! 用 topk_idxs 选择要 attend 的位置
+ *     滑动窗口: 最近 128 个 token 全精度
+ *     压缩: 交替层把旧 KV 压缩 (ratio 4 或 128)
+ *     attn_sink: 每头一个可学习偏置 (稳定性)
+ *
+ *   输出路径:
+ *     o[64 heads × 512] → reshape 为 [8 groups, group_dim]
+ *     → wo_a[8192, group_dim] (分组 LoRA)
+ *     → wo_b[4096, 8192]
+ *     → 输出[4096]
+ *
+ *   MoE MLP:
+ *     x[4096] → router[256, 4096] → 选 top-6 专家
+ *     每个专家: w1[2048,2048] w2[4096,1024] w3[2048,2048] (SwiGLU)
+ *     + 1 个共享专家
+ *
+ *   量化:
+ *     attention 权重: F8_E4M3 (权重) + F8_E8M0 (scale), block [128,128]
+ *     expert 权重: I8 (权重) + F8_E8M0 (scale)
  */
 
-#include "net.h"  /* 复用 Config 基础类型 */
 #include <stdint.h>
 #include <stdio.h>
 
-/* ============ DeepSeek V4 Flash 配置 ============ */
+/* ============ DeepSeek V4 Flash 配置 (来自 config.json) ============ */
 typedef struct {
-    /* 基础参数 */
+    /* 基础 */
     int   hidden_size;            /* 4096 */
     int   num_hidden_layers;      /* 43 */
     int   vocab_size;             /* 129280 */
     int   max_position;           /* 1048576 (1M) */
     float rope_theta;             /* 10000 */
     float rms_norm_eps;           /* 1e-6 */
-    int   tie_word_embeddings;    /* false → 有独立 lm_head */
+    int   tie_word_embeddings;    /* 0 (false, 有独立 lm_head) */
     int   bos_token_id;           /* 0 */
     int   eos_token_id;           /* 1 */
 
-    /* MLA Attention 参数 */
-    int   num_attention_heads;    /* 64 */
+    /* MLA Attention */
+    int   n_heads;                /* 64 */
     int   head_dim;               /* 512 */
-    int   num_key_value_heads;    /* 1 (MLA 只用 1 个 KV 头) */
     int   q_lora_rank;            /* 1024 (query 压缩维度) */
-    int   qk_rope_head_dim;       /* 64 (解耦 RoPE 维度) */
-    int   o_lora_rank;            /* 1024 (输出压缩) */
-    int   o_groups;               /* 8 */
+    int   qk_rope_head_dim;       /* 64 (RoPE 维度, head_dim 的最后 64 维) */
+    int   nope_head_dim;          /* 448 (= head_dim - rope_head_dim) */
+    int   o_lora_rank;            /* 1024 */
+    int   o_groups;               /* 8 (输出分组数) */
 
-    /* Index Attention (稀疏注意力, 1M 上下文) */
-    int   index_head_dim;         /* 128 */
-    int   index_n_heads;          /* 64 */
-    int   index_topk;             /* 512 */
+    /* 滑动窗口 + 压缩 */
     int   sliding_window;         /* 128 */
+    int   compress_rope_theta;    /* 160000 */
 
-    /* MoE 参数 */
+    /* MoE */
     int   n_routed_experts;       /* 256 */
     int   n_shared_experts;       /* 1 */
     int   num_experts_per_tok;    /* 6 (top-6) */
-    int   moe_intermediate_size;  /* 2048 (每个专家的 MLP 宽度) */
-    int   num_hash_layers;        /* 3 (前 3 层用 hash routing) */
+    int   moe_intermediate_size;  /* 2048 */
+    int   num_hash_layers;        /* 3 (前3层用 hash routing) */
     float routed_scaling_factor;  /* 1.5 */
     float swiglu_limit;           /* 10.0 */
 
-    /* DSpark 投机解码 */
-    int   num_nextn_predict_layers; /* 1 */
-    int   dspark_block_size;        /* 5 (一次猜 5 个 token) */
-    int   dspark_noise_token_id;    /* 128799 */
+    /* DSpark */
+    int   dspark_block_size;      /* 5 */
+    int   dspark_noise_token_id;  /* 128799 */
 
-    /* 量化 */
-    /* 原生 FP8 (e4m3) + 专家 FP4, block_size [128,128] */
-} DeepSeekConfig;
+    /* Index attention (稀疏注意力) */
+    int   index_head_dim;         /* 128 */
+    int   index_n_heads;          /* 64 */
+    int   index_topk;             /* 512 */
+} DSConfig;
 
-/* ============ MLA Attention 权重 ============ */
-/* 一层的 MLA attention 权重 */
+/* ============ MLA Attention 权重 (一层的) ============ */
+/* 张量名对应 safetensors 里的 layers.{l}.attn.xxx */
 typedef struct {
     /* Query 压缩 */
-    float *W_DQ;          /* (q_lora_rank, hidden_size) = (1024, 4096) */
-    float *W_UQ;          /* (n_heads * (head_dim - rope_dim), q_lora_rank) */
+    float *wq_a;          /* [1024, 4096] = [q_lora_rank, hidden] */
+    float *wq_a_scale;    /* FP8 scale [8, 32] */
+    float *wq_b;          /* [32768, 1024] = [n_heads*head_dim, q_lora_rank] */
+    float *wq_b_scale;    /* FP8 scale [256, 8] */
+    float *q_norm;        /* [1024] RMSNorm weight */
 
-    /* KV 压缩 (MLA 核心) */
-    float *W_DKV;         /* (kv_lora_rank, hidden_size) — 实际用 index_head_dim? */
-    float *W_UK;          /* (n_heads * (head_dim - rope_dim), kv_compress) */
-    float *W_UV;          /* (n_heads * head_dim, kv_compress) */
+    /* KV 压缩 (MLA 核心 — 只存这个 latent!) */
+    float *wkv;           /* [512, 4096] = [head_dim, hidden] */
+    float *wkv_scale;     /* FP8 scale [4, 32] */
+    float *kv_norm;       /* [512] RMSNorm weight */
 
-    /* 解耦 RoPE */
-    float *W_KR;          /* (qk_rope_head_dim, hidden_size) = (64, 4096) */
+    /* 输出投影 (分组 LoRA) */
+    float *wo_a;          /* [8192, 4096] = [o_groups*o_lora_rank, hidden/o_groups] */
+    float *wo_a_scale;    /* FP8 scale [64, 32] */
+    float *wo_b;          /* [4096, 8192] = [hidden, o_groups*o_lora_rank] */
+    float *wo_b_scale;    /* FP8 scale [32, 64] */
 
-    /* 输出投影 (带 LoRA 压缩) */
-    float *W_O;           /* (hidden_size, n_heads * head_dim) — 或通过 o_lora_rank */
+    /* Attention sink (稳定性) */
+    float *attn_sink;     /* [64] = [n_heads] 每头一个偏置 */
 
-    /* RMSNorm */
-    float *rms_weight;    /* (hidden_size,) */
+    /* 输入 RMSNorm */
+    float *attn_norm;     /* [4096] */
 } MLAWeights;
 
-/* ============ MoE MLP 权重 ============ */
-/* 单个专家 (就是一个小的 SwiGLU MLP) */
+/* ============ MoE 专家 ============ */
+/* 单个专家 = SwiGLU MLP (张量名: layers.{l}.ffn.experts.{e}.w{1,2,3}) */
 typedef struct {
-    float *w_gate;        /* (moe_intermediate_size, hidden_size) = (2048, 4096) */
-    float *w_up;          /* (2048, 4096) */
-    float *w_down;        /* (4096, 2048) */
-} ExpertWeights;
+    float *w1;            /* [2048, 2048] gate weight */
+    float *w1_scale;      /* FP8 scale [2048, 128] */
+    float *w2;            /* [4096, 1024] down weight */
+    float *w2_scale;      /* FP8 scale [4096, 64] */
+    float *w3;            /* [2048, 2048] up weight */
+    float *w3_scale;      /* FP8 scale [2048, 128] */
+} Expert;
 
-/* 一层的完整 MoE 权重 */
+/* 一层的 MoE 权重 */
 typedef struct {
-    float *W_router;               /* (n_routed_experts, hidden_size) = (256, 4096) */
-    ExpertWeights *experts;         /* [n_routed_experts] = [256] 个专家 */
-    ExpertWeights shared_expert;    /* 1 个共享专家 (常驻内存) */
-    float *rms_weight;             /* (hidden_size,) RMSNorm */
+    /* Router */
+    float *gate_weight;           /* [256, 4096] = [n_experts, hidden] */
+    float *gate_bias;             /* [256] = [n_experts] (hash 层不用) */
+
+    /* 256 个路由专家 (磁盘上, 按需加载) */
+    Expert *experts;              /* [256] */
+
+    /* 1 个共享专家 (常驻内存) */
+    Expert shared_expert;
+
+    /* Hash routing (前3层) */
+    int *tid2eid;                 /* [vocab_size, num_experts_per_tok] hash 表 */
+
+    /* FFN RMSNorm */
+    float *ffn_norm;             /* [4096] */
 } MoEWeights;
 
-/* ============ KV Cache (MLA 压缩版) ============ */
-/* MLA 只存压缩 latent, 不存完整 K/V */
+/* ============ KV Cache (V4 压缩版) ============ */
+/*
+ * V4 的 KV Cache 设计:
+ *   滑动窗口区: 最近 128 个 token 的 kv[512] (全精度)
+ *   压缩区: 压缩后的旧 kv (compress_ratio 决定压缩程度)
+ *
+ * 每位置只存 kv[512] (不是 K+V!)
+ * 比标准 attention 省: (2 × n_heads × head_dim) / head_dim = 2 × 64 = 128×
+ */
 typedef struct {
-    /* 热区: 最近 N 个 token, fp16, 在 RAM */
-    float *hot_latent;     /* (n_layers, hot_size, kv_compress_dim) */
-    float *hot_kr;         /* (n_layers, hot_size, qk_rope_head_dim) */
-    int    hot_size;       /* 热区大小 (如 8192) */
+    /* 滑动窗口区 (常驻 RAM, 全精度) */
+    float *win_kv;               /* [n_layers, window_size, head_dim] = [43, 128, 512] */
+    float *win_kr;               /* [n_layers, window_size, rope_dim] = [43, 128, 64] */
 
-    /* 温区: int4 量化, 在 RAM */
-    uint8_t *warm_latent;  /* int4 打包 */
-    int      warm_size;
+    /* 压缩区 (按层, 有的层 ratio=0 不压缩, 有的 ratio=4 或 128) */
+    float *compress_kv;          /* 压缩后的旧 KV (mmap 到 SSD) */
 
-    /* 冷区: mmap 到 SSD */
-    float *cold_latent;    /* mmap, OS 自动分页 */
-    int    cold_size;
-
-    int current_pos;       /* 当前写到哪了 */
-} DeepSeekKVCache;
-
-/* ============ DSpark 草稿模块 ============ */
-typedef struct {
-    float *embed;          /* 和主模型共享 embedding */
-    /* 几层轻量 transformer (1 层) */
-    MLAWeights attn;
-    MoEWeights moe;
-    float *rms_weight;
-    float *lm_head;        /* 输出投影 */
-} DraftModule;
+    int current_win_pos;         /* 滑动窗口当前写入位置 */
+} DSKVCache;
 
 /* ============ 完整模型 ============ */
 typedef struct {
-    DeepSeekConfig cfg;
+    DSConfig cfg;
 
-    /* Embedding */
-    float *token_embedding;   /* (vocab_size, hidden_size) = (129280, 4096) */
-    float *lm_head;           /* (vocab_size, hidden_size) — 不 tie! */
+    /* Embedding + LM Head (不 tie) */
+    float *token_embedding;       /* [129280, 4096] */
+    float *lm_head;               /* [129280, 4096] */
 
-    /* 43 层: 每层有 MLA + MoE */
-    MLAWeights *mla_layers;   /* [43] */
-    MoEWeights *moe_layers;   /* [43] */
+    /* 43 层 */
+    MLAWeights *mla;              /* [43] */
+    MoEWeights *moe;              /* [43] */
 
     /* 最终 norm */
-    float *final_rms_weight;
+    float *final_norm;           /* [4096] */
 
-    /* DSpark 草稿模块 */
-    DraftModule draft;
+    /* 运行状态 */
+    DSKVCache kv_cache;
 } DeepSeekModel;
 
 /* ============ 初始化 ============ */
 
-/* 用 config.json 的值填充 DeepSeekConfig */
-static void deepseek_v4_flash_config(DeepSeekConfig *c) {
+static void deepseek_v4_config(DSConfig *c) {
     c->hidden_size            = 4096;
     c->num_hidden_layers      = 43;
     c->vocab_size             = 129280;
@@ -167,18 +200,16 @@ static void deepseek_v4_flash_config(DeepSeekConfig *c) {
     c->bos_token_id           = 0;
     c->eos_token_id           = 1;
 
-    c->num_attention_heads    = 64;
+    c->n_heads                = 64;
     c->head_dim               = 512;
-    c->num_key_value_heads    = 1;
     c->q_lora_rank            = 1024;
     c->qk_rope_head_dim       = 64;
+    c->nope_head_dim          = c->head_dim - c->qk_rope_head_dim; /* 448 */
     c->o_lora_rank            = 1024;
     c->o_groups               = 8;
 
-    c->index_head_dim         = 128;
-    c->index_n_heads          = 64;
-    c->index_topk             = 512;
     c->sliding_window         = 128;
+    c->compress_rope_theta    = 160000;
 
     c->n_routed_experts       = 256;
     c->n_shared_experts       = 1;
@@ -188,48 +219,44 @@ static void deepseek_v4_flash_config(DeepSeekConfig *c) {
     c->routed_scaling_factor  = 1.5f;
     c->swiglu_limit           = 10.0f;
 
-    c->num_nextn_predict_layers = 1;
-    c->dspark_block_size       = 5;
-    c->dspark_noise_token_id   = 128799;
+    c->dspark_block_size      = 5;
+    c->dspark_noise_token_id  = 128799;
+
+    c->index_head_dim         = 128;
+    c->index_n_heads          = 64;
+    c->index_topk             = 512;
 }
 
-/* 参数量计算 */
-static void deepseek_print_params(DeepSeekConfig *c) {
-    long embed = (long)c->vocab_size * c->hidden_size;
-    long lm_head = embed; /* 不 tie */
+/* KV Cache 内存分析 */
+static void deepseek_kv_cache_analysis(DSConfig *c) {
+    int win = c->sliding_window;  /* 128 */
+    int hd = c->head_dim;         /* 512 */
+    int rd = c->qk_rope_head_dim; /* 64 */
+    int L  = c->num_hidden_layers; /* 43 */
 
-    /* MLA 每层 */
-    long mla_per_layer =
-        (long)c->q_lora_rank * c->hidden_size +           /* W_DQ */
-        (long)c->num_attention_heads * (c->head_dim - c->qk_rope_head_dim) * c->q_lora_rank + /* W_UQ */
-        /* W_DKV, W_UK, W_UV — 需要确认精确维度 */
-        (long)c->num_attention_heads * c->head_dim * c->q_lora_rank +  /* W_UK + W_UV 估计 */
-        (long)c->qk_rope_head_dim * c->hidden_size +     /* W_KR */
-        (long)c->hidden_size * c->num_attention_heads * c->head_dim;   /* W_O */
+    /* 滑动窗口区 */
+    long win_kv = (long)L * win * hd * 4;  /* fp32 */
+    printf("=== V4 Flash KV Cache 分析 ===\n\n");
+    printf("滑动窗口区 (%d token):\n", win);
+    printf("  每位置: kv[%d] = %d 字节 (fp32)\n", hd, hd*4);
+    printf("  %d 层 × %d 位置 × %d 字节 = %ld MB\n\n",
+           L, win, hd*4, win_kv / (1024*1024));
 
-    /* MoE 每层 */
-    long expert_size = (long)c->moe_intermediate_size * c->hidden_size * 3; /* gate + up + down */
-    long moe_per_layer =
-        (long)c->n_routed_experts * c->hidden_size +     /* W_router */
-        (long)c->n_routed_experts * expert_size +         /* 256 个专家 */
-        expert_size;                                       /* 1 个共享专家 */
+    /* 对比标准 attention */
+    long standard = (long)L * win * 2 * c->n_heads * hd * 4;
+    printf("标准 attention 同样 128 窗口:\n");
+    printf("  每位置: K[%d] + V[%d] = %d 字节\n",
+           c->n_heads*hd, c->n_heads*hd, 2*c->n_heads*hd*4);
+    printf("  %d 层 = %ld MB\n\n", L, standard/(1024*1024));
+    printf("V4 MLA 压缩比: %.0fx\n\n", (double)standard / win_kv);
 
-    long total_layers = (mla_per_layer + moe_per_layer) * c->num_hidden_layers;
-    long total = embed + lm_head + total_layers;
-
-    printf("DeepSeek V4 Flash 参数量:\n");
-    printf("  Embedding:     %ld (%.1fB)\n", embed, embed/1e9);
-    printf("  LM Head:       %ld (%.1fB)\n", lm_head, lm_head/1e9);
-    printf("  MLA/层:        %ld (%.1fB)\n", mla_per_layer, mla_per_layer/1e9);
-    printf("  MoE/层:        %ld (%.1fB)\n", moe_per_layer, moe_per_layer/1e9);
-    printf("  43层合计:      %ld (%.1fB)\n", total_layers, total_layers/1e9);
-    printf("  总参数:        %ld (%.1fB)\n", total, total/1e9);
-    printf("\n");
-    printf("  每token激活参数:\n");
-    long active = mla_per_layer + expert_size * c->num_experts_per_tok + expert_size;
-    printf("    MLA + 6专家 + 1共享 = %ld (%.1fB)\n", active, active/1e9);
-    long active_total = active * c->num_hidden_layers;
-    printf("    43层合计: %ld (%.1fB)\n", active_total, active_total/1e9);
+    /* 1M 上下文 */
+    long seq_1m = (long)L * 1048576 * hd * 4;
+    printf("如果 1M 上下文全精度:\n");
+    printf("  %ld GB (不可能)\n\n", seq_1m / (1024*1024*1024));
+    printf("V4 方案: 滑动窗口 128 + 压缩区\n");
+    printf("  RAM: %ld MB (滑动窗口)\n", win_kv / (1024*1024));
+    printf("  压缩区用 mmap SSD, 不占 RAM\n");
 }
 
 #endif // DEEPSEEK_H
