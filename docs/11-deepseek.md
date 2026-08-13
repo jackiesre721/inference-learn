@@ -357,6 +357,173 @@ DSpark:
 
 ---
 
+## 11.8 GPU 加速：充分利用 M3 Pro 的 14 核 GPU
+
+### 为什么 M3 Pro 的 GPU 特别适合
+
+```
+传统 PC (CPU + NVIDIA GPU):
+  权重在 CPU 内存 → 拷贝到 GPU 显存 → GPU 计算 → 结果拷贝回 CPU
+  拷贝开销大: PCIe 带宽只有 ~32 GB/s
+  这个拷贝是最大的性能杀手
+
+M3 Pro (统一内存架构):
+  权重在 18GB 统一内存 → GPU 直接访问 → GPU 计算 → CPU 直接读结果
+  零拷贝! CPU 和 GPU 看同一块内存
+  带宽: ~150 GB/s (比 PCIe 快 5×)
+```
+
+### GPU 能提供多少算力
+
+```
+M3 Pro GPU 规格:
+  14 核 GPU
+  Metal 4 支持
+  fp32: ~5 TFLOPS
+  fp16/bf16: ~15 TFLOPS
+  int4/int8: ~30 TOPS (估算)
+
+对比 CPU:
+  11 核 CPU fp32: ~100 GFLOPS = 0.1 TFLOPS
+  GPU 比 CPU 快: 50-300× (取决于精度)
+
+关键: 13B 激活参数的计算量 = 26 GFLOP/token
+  CPU: 26G / 0.1T = 260ms → 4 tok/s
+  GPU (fp16): 26G / 15T = 1.7ms → 588 tok/s (理论)
+  GPU (int4): 26G / 30T = 0.87ms → 1149 tok/s (理论)
+
+结论: GPU 计算能力完全不是瓶颈!
+       真正瓶颈是内存带宽 (150 GB/s)
+```
+
+### GPU + CPU 异步流水线 (核心优化)
+
+```
+不只是"GPU 替代 CPU 算 matmul", 而是 GPU 和 CPU 各干各的:
+
+时间线:
+  CPU: [从SSD预取专家] [路由计算] [从SSD预取] [路由] ...
+  GPU: [MLA Attention]  [MoE 专家计算] [MLA]   [MoE]  ...
+
+CPU 负责: I/O (mmap/madvise) + 路由 (轻量计算) + KV Cache 管理
+GPU 负责: MLA Attention + MoE 专家的矩阵乘法 (重量计算)
+
+两者并行: CPU 预取下一层专家的同时, GPU 算当前层
+→ I/O 延迟完全隐藏在 GPU 计算后面
+→ 理论上速度只受 GPU 计算限制, 不受 SSD 限制
+```
+
+### Metal 实现方案
+
+```
+方案 A: Metal Compute Shaders (最佳性能, 最复杂)
+  - 用 Metal Shading Language 写 matmul kernel
+  - 数据在统一内存, GPU 直接访问 (零拷贝)
+  - 需要写 .metal 文件 + Objective-C 桥接
+  - 代码量: ~300 行 Metal shader + ~100 行桥接
+  - 预期速度: 30-50 tok/s
+
+方案 B: Accelerate 框架 (中等性能, 较简单)
+  - macOS 自带的 vDSP 库, 底层用 SIMD/NEON
+  - 纯 C 调用, 不需要 Metal 知识
+  - 代码量: ~50 行 (替换 matmul)
+  - 预期速度: 15-25 tok/s
+  - 注: 严格说这不是 GPU, 是 CPU SIMD, 但 Apple 优化过
+
+方案 C: OpenMP 多线程 (最简单, 性能一般)
+  - 5 个 P 核并行 matmul
+  - 代码量: 3 行 (#pragma omp parallel for)
+  - 预期速度: 10-15 tok/s
+  - 不用 GPU
+```
+
+### 方案 A 的 Metal shader 示意
+
+```metal
+// matmul.metal — GPU 矩阵乘法 kernel
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void matmul_int4(
+    device const uint8_t *weights [[buffer(0)]],  // int4 打包权重
+    device const float   *x       [[buffer(1)]],  // 输入向量
+    device float         *out     [[buffer(2)]],  // 输出
+    constant int         &n       [[buffer(3)]],  // 输入维度
+    constant int         &d       [[buffer(4)]],  // 输出维度
+    uint tid [[thread_position_in_grid]]
+) {
+    // 每个 GPU 线程算输出的一行
+    if (tid >= d) return;
+    float val = 0;
+    for (int j = 0; j < n; j++) {
+        // int4 解码: 两个权重打包在一个字节里
+        uint8_t packed = weights[tid * n / 2 + j / 2];
+        float w = (j % 2 == 0) ? (packed >> 4) - 8 : (packed & 0xF) - 8;
+        val += w * x[j];
+    }
+    out[tid] = val;
+}
+```
+
+```c
+// C 侧调用 (Objective-C++ 桥接)
+// 关键: 数据在统一内存, 不需要拷贝!
+id<MTLBuffer> weightBuf = [device newBufferWithBytesNoCopy:
+    weights_ptr length:size options:MTLResourceStorageModeShared];
+// weights_ptr 就是 mmap 的地址, GPU 直接访问, 零拷贝
+```
+
+### 为什么统一内存是杀手锏
+
+```
+其他 GPU (NVIDIA/AMD):
+  1. 权重从 SSD 加载到 CPU 内存 (mmap)
+  2. 从 CPU 内存拷贝到 GPU 显存 (PCIe, 慢!)
+  3. GPU 计算
+  4. 结果拷贝回 CPU 内存 (PCIe, 慢!)
+  → 拷贝开销可能比计算还大
+
+M3 Pro 统一内存:
+  1. 权重从 SSD 加载到统一内存 (mmap)
+  2. GPU 直接访问 (零拷贝!)
+  3. GPU 计算
+  4. CPU 直接读结果 (零拷贝!)
+  → 没有拷贝开销, GPU 和 CPU 无缝协作
+
+这就是为什么 M3 Pro 18GB 能跑 284B 模型:
+  mmap 142GB → 热页在统一内存 → GPU 直接算 → 不用拷贝
+  换成 PC: mmap 142GB → 拷贝到 GPU (PCIe 慢) → 算 → 拷贝回 (PCIe 慢)
+  PC 的拷贝开销会让一切慢 5-10×
+```
+
+### 实际 GPU 利用策略
+
+```
+DeepSeek V4 Flash 一层的前向传播:
+
+  ┌─ CPU 做 (轻量) ────────────────────────┐
+  │ 1. RMSNorm (维度小, CPU 够快)          │
+  │ 2. Router 计算 top-6 (只算 256 个分数) │
+  │ 3. madvise 预取下一层专家              │
+  │ 4. KV Cache 管理 (热冷分离)            │
+  └───────────────────────────────────────┘
+  ┌─ GPU 做 (重量) ────────────────────────┐
+  │ 1. MLA Attention 的矩阵乘法            │
+  │    (W_DKV 压缩 + W_UK/W_UV 解压)      │
+  │ 2. 6 个专家的 SwiGLU 计算              │
+  │    (6 × gate/up/down = 18 个 matmul)  │
+  │ 3. 共享专家的计算                      │
+  └───────────────────────────────────────┘
+
+CPU 和 GPU 重叠执行:
+  时间 →
+  CPU: [Norm+Route] [预取] [Norm+Route] [预取]
+  GPU: [Attention]  [Experts]  [Attention]  [Experts]
+       ↑ 当前层              ↑ 下一层 (专家已预取到位)
+```
+
+---
+
 ## 11.9 内存预算分析
 
 ### 128K 上下文 (编码辅助典型场景)
