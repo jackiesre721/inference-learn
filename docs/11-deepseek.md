@@ -357,7 +357,7 @@ DSpark:
 
 ---
 
-## 11.8 GPU 加速：充分利用 M3 Pro 的 14 核 GPU
+## 11.9 GPU 加速：充分利用 M3 Pro 的 14 核 GPU
 
 ### 为什么 M3 Pro 的 GPU 特别适合
 
@@ -524,7 +524,7 @@ CPU 和 GPU 重叠执行:
 
 ---
 
-## 11.9 内存预算分析
+## 11.10 内存预算分析
 
 ### 128K 上下文 (编码辅助典型场景)
 
@@ -561,40 +561,79 @@ M3 Pro                       18 GB      ✓
 
 ---
 
-## 11.10 实现路线图
+## 11.11 实现路线图
 
-### 阶段 1: 架构研究 + Config
+### 阶段 1: 架构研究 + Config (~20K tokens)
 - 确认 DeepSeek V4 Flash 的精确 config 参数
-- 确认 MLA 矩阵维度
-- 确认 MoE 专家结构
+- 确认 MLA 矩阵维度 (d_c, d_r, n_heads, d_head)
+- 确认 MoE 专家结构 (n_experts, top_k, expert_dim)
+- 新增 `deepseek.h` 配置结构体
 
-### 阶段 2: MLA Attention (~200 行)
-- 低秩压缩 (W_DKV)
-- 解压 (W_UK, W_UV)
-- 解耦 RoPE (W_KR, W_QR)
-- 压缩 KV Cache (只存 latent)
+### 阶段 2: MLA Attention (~60K tokens, ~200 行)
+- 低秩压缩 (W_DKV): x → c_kv
+- 解压 (W_UK, W_UV): c_kv → K, V
+- 解耦 RoPE (W_KR, W_QR): 单独的 RoPE key/query
+- 压缩 KV Cache: 只存 c_kv latent, 不存完整 K/V
+- 数值验证: 和 PyTorch 对比
 
-### 阶段 3: MoE MLP (~150 行)
-- Router (top-6 选择)
-- Expert dispatch
-- Shared expert (常驻)
-- mmap 专家加载
+### 阶段 3: MoE MLP (~45K tokens, ~150 行)
+- Router (W_router): 算 256 个分数, 选 top-6
+- Expert dispatch: 激活 6 个专家 + 1 个共享专家
+- mmap 专家加载: 256 个专家在磁盘, 按需加载
+- Shared expert: 常驻内存 (每层 1 个)
 
-### 阶段 4: int4 量化 (~100 行)
-- 权重 int4 存储
-- matmul int4 解码 + 计算
+### 阶段 4: int4 量化 (~30K tokens, ~100 行)
+- 权重 int4 存储 (两个权重打包 1 字节)
+- matmul_int4(): int4 解码 + fp16 中间计算
+- 精度验证: int4 vs fp32 输出对比
 
-### 阶段 5: mmap + 性能优化 (~200 行)
-- 大文件 mmap
-- madvise 预取
-- OpenMP 多线程
-- Metal GPU (后续)
+### 阶段 5: GPU 加速 — Metal (~80K tokens, ~400 行)
+- Metal compute shader: int4 matmul kernel
+- Objective-C++ 桥接: MTLDevice / MTLBuffer / MTLCommandQueue
+- 统一内存零拷贝: newBufferWithBytesNoCopy
+- GPU + CPU 异步流水线:
+  - CPU: I/O (madvise) + Router + KV Cache 管理
+  - GPU: MLA Attention + MoE 专家 matmul
+- madvise 预取优化
+- OpenMP (阶段 5 之前的备选方案, 3 行代码)
 
-### 阶段 6: DSpark 投机解码 (~200 行)
-- MTP 草稿模块
-- 验证逻辑
+### 阶段 6: DSpark 投机解码 (~50K tokens, ~200 行)
+- MTP 草稿模块: 轻量 transformer 预测 3 个 token
+- 验证逻辑: 大模型一次 forward 验证 3 个候选
+- 接受率调优: --spec-draft-n-max 参数
+- 预期: 1.85× 无损加速
 
-总计: ~850 行新代码 + 现有 3300 行 = ~4150 行
+### 阶段 7: 调试 + 测试 + 文档 (~40K tokens)
+- 数值验证 (和 PyTorch 对比 logits)
+- 性能基准 (各阶段 tok/s)
+- 端到端测试 (编码辅助场景)
+- 更新第 11 章文档
+
+### 总计
+
+```
+阶段          代码量      tokens      速度预期
+──────────────────────────────────────────────────
+1. 研究+Config  ~50行     ~20K        —
+2. MLA         ~200行     ~60K        ~0.5 tok/s
+3. MoE         ~150行     ~45K        ~2 tok/s
+4. int4        ~100行     ~30K        ~5 tok/s
+5. GPU Metal   ~400行     ~80K        ~15 tok/s
+6. DSpark      ~200行     ~50K        ~28 tok/s
+7. 测试+文档    ~200行     ~40K        —
+──────────────────────────────────────────────────
+总计          ~1300行     ~325K       ~50 tok/s
+
+现有引擎: 3300行 → 完整版: ~4600行
+```
+
+### 最小可行方案 (先跑通)
+
+只做阶段 1-3 (~125K tokens), 不做量化/GPU/投机解码:
+- 能加载 DeepSeek V4 Flash 权重
+- 能跑 MLA + MoE 前向传播
+- 速度 ~2 tok/s (fp32 CPU, 慢但能跑)
+- 验证架构正确后再加优化
 
 ---
 
