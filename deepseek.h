@@ -228,35 +228,22 @@ static void deepseek_v4_config(DSConfig *c) {
 }
 
 /* KV Cache 内存分析 */
-static void deepseek_kv_cache_analysis(DSConfig *c) {
-    int win = c->sliding_window;  /* 128 */
-    int hd = c->head_dim;         /* 512 */
-    int rd = c->qk_rope_head_dim; /* 64 */
-    int L  = c->num_hidden_layers; /* 43 */
+void deepseek_kv_cache_analysis(DSConfig *c);
 
-    /* 滑动窗口区 */
-    long win_kv = (long)L * win * hd * 4;  /* fp32 */
-    printf("=== V4 Flash KV Cache 分析 ===\n\n");
-    printf("滑动窗口区 (%d token):\n", win);
-    printf("  每位置: kv[%d] = %d 字节 (fp32)\n", hd, hd*4);
-    printf("  %d 层 × %d 位置 × %d 字节 = %ld MB\n\n",
-           L, win, hd*4, win_kv / (1024*1024));
+/* ============ 前向传播函数 (在 deepseek.c 里实现) ============ */
+void ds_mla_forward(float *out, const float *x, const MLAWeights *w,
+                    const DSConfig *cfg, int pos,
+                    float *kv_win, int *win_pos);
+void ds_moe_route(int *selected, float *weights,
+                  const float *x, const MoEWeights *moe,
+                  const DSConfig *cfg, int layer_id);
+void ds_moe_forward(float *out, const float *x,
+                    const MoEWeights *moe,
+                    const DSConfig *cfg, int layer_id);
+void ds_layer_forward(float *x, const MLAWeights *mla, const MoEWeights *moe,
+                      const DSConfig *cfg, int layer_id, int pos,
+                      float *kv_win, int *win_pos);
 
-    /* 对比标准 attention */
-    long standard = (long)L * win * 2 * c->n_heads * hd * 4;
-    printf("标准 attention 同样 128 窗口:\n");
-    printf("  每位置: K[%d] + V[%d] = %d 字节\n",
-           c->n_heads*hd, c->n_heads*hd, 2*c->n_heads*hd*4);
-    printf("  %d 层 = %ld MB\n\n", L, standard/(1024*1024));
-    printf("V4 MLA 压缩比: %.0fx\n\n", (double)standard / win_kv);
-
-    /* 1M 上下文 */
-    long seq_1m = (long)L * 1048576 * hd * 4;
-    printf("如果 1M 上下文全精度:\n");
-    printf("  %ld GB (不可能)\n\n", seq_1m / (1024*1024*1024));
-    printf("V4 方案: 滑动窗口 128 + 压缩区\n");
-    printf("  RAM: %ld MB (滑动窗口)\n", win_kv / (1024*1024));
-    printf("  压缩区用 mmap SSD, 不占 RAM\n");
-}
+/* ============ KV Cache 分析 (在 deepseek.c 实现) ============ */
 
 #endif // DEEPSEEK_H
